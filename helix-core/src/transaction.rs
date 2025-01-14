@@ -1,8 +1,12 @@
-use crate::{Range, Rope, Selection, Tendril};
-use std::borrow::Cow;
+use ropey::RopeSlice;
+use smallvec::SmallVec;
+
+use crate::{chars::char_is_word, Range, Rope, Selection, Tendril};
+use std::{borrow::Cow, iter::once};
 
 /// (from, to, replacement)
 pub type Change = (usize, usize, Option<Tendril>);
+pub type Deletion = (usize, usize);
 
 // TODO: pub(crate)
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -19,25 +23,48 @@ pub enum Operation {
 pub enum Assoc {
     Before,
     After,
+    /// Acts like `After` if a word character is inserted
+    /// after the position, otherwise acts like `Before`
+    AfterWord,
+    /// Acts like `Before` if a word character is inserted
+    /// before the position, otherwise acts like `After`
+    BeforeWord,
+    /// Acts like `Before` but if the position is within an exact replacement
+    /// (exact size) the offset to the start of the replacement is kept
+    BeforeSticky,
+    /// Acts like `After` but if the position is within an exact replacement
+    /// (exact size) the offset to the start of the replacement is kept
+    AfterSticky,
 }
 
-// ChangeSpec = Change | ChangeSet | Vec<Change>
-#[derive(Debug, Clone, PartialEq, Eq)]
+impl Assoc {
+    /// Whether to stick to gaps
+    fn stay_at_gaps(self) -> bool {
+        !matches!(self, Self::BeforeWord | Self::AfterWord)
+    }
+
+    fn insert_offset(self, s: &str) -> usize {
+        let chars = s.chars().count();
+        match self {
+            Assoc::After | Assoc::AfterSticky => chars,
+            Assoc::AfterWord => s.chars().take_while(|&c| char_is_word(c)).count(),
+            // return position before inserted text
+            Assoc::Before | Assoc::BeforeSticky => 0,
+            Assoc::BeforeWord => chars - s.chars().rev().take_while(|&c| char_is_word(c)).count(),
+        }
+    }
+
+    pub fn sticky(self) -> bool {
+        matches!(self, Assoc::BeforeSticky | Assoc::AfterSticky)
+    }
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct ChangeSet {
     pub(crate) changes: Vec<Operation>,
     /// The required document length. Will refuse to apply changes unless it matches.
     len: usize,
     len_after: usize,
-}
-
-impl Default for ChangeSet {
-    fn default() -> Self {
-        Self {
-            changes: Vec::new(),
-            len: 0,
-            len_after: 0,
-        }
-    }
 }
 
 impl ChangeSet {
@@ -50,7 +77,7 @@ impl ChangeSet {
     }
 
     #[must_use]
-    pub fn new(doc: &Rope) -> Self {
+    pub fn new(doc: RopeSlice) -> Self {
         let len = doc.len_chars();
         Self {
             changes: Vec::new(),
@@ -60,7 +87,6 @@ impl ChangeSet {
     }
 
     // TODO: from iter
-    //
 
     #[doc(hidden)] // used by lsp to convert to LSP changes
     pub fn changes(&self) -> &[Operation] {
@@ -68,7 +94,7 @@ impl ChangeSet {
     }
 
     // Changeset builder operations: delete/insert/retain
-    fn delete(&mut self, n: usize) {
+    pub(crate) fn delete(&mut self, n: usize) {
         use Operation::*;
         if n == 0 {
             return;
@@ -83,7 +109,7 @@ impl ChangeSet {
         }
     }
 
-    fn insert(&mut self, fragment: Tendril) {
+    pub(crate) fn insert(&mut self, fragment: Tendril) {
         use Operation::*;
 
         if fragment.is_empty() {
@@ -95,7 +121,7 @@ impl ChangeSet {
 
         let new_last = match self.changes.as_mut_slice() {
             [.., Insert(prev)] | [.., Insert(prev), Delete(_)] => {
-                prev.push_tendril(&fragment);
+                prev.push_str(&fragment);
                 return;
             }
             [.., last @ Delete(_)] => std::mem::replace(last, Insert(fragment)),
@@ -105,7 +131,7 @@ impl ChangeSet {
         self.changes.push(new_last);
     }
 
-    fn retain(&mut self, n: usize) {
+    pub(crate) fn retain(&mut self, n: usize) {
         use Operation::*;
         if n == 0 {
             return;
@@ -199,7 +225,7 @@ impl ChangeSet {
                             // TODO: cover this with a test
                             // figure out the byte index of the truncated string end
                             let (pos, _) = s.char_indices().nth(j).unwrap();
-                            s.pop_front(pos as u32);
+                            s.replace_range(0..pos, "");
                             head_a = Some(Insert(s));
                             head_b = changes_b.next();
                         }
@@ -221,9 +247,11 @@ impl ChangeSet {
                         Ordering::Greater => {
                             // figure out the byte index of the truncated string end
                             let (pos, _) = s.char_indices().nth(j).unwrap();
-                            let pos = pos as u32;
-                            changes.insert(s.subtendril(0, pos));
-                            head_a = Some(Insert(s.subtendril(pos, s.len() as u32 - pos)));
+                            let mut before = s;
+                            let after = before.split_off(pos);
+
+                            changes.insert(before);
+                            head_a = Some(Insert(after));
                             head_b = changes_b.next();
                         }
                     }
@@ -287,7 +315,7 @@ impl ChangeSet {
                 }
                 Delete(n) => {
                     let text = Cow::from(original_doc.slice(pos..pos + *n));
-                    changes.insert(Tendril::from_slice(&text));
+                    changes.insert(Tendril::from(text.as_ref()));
                     pos += n;
                 }
                 Insert(s) => {
@@ -330,23 +358,83 @@ impl ChangeSet {
     /// `true` when the set is empty.
     #[inline]
     pub fn is_empty(&self) -> bool {
-        self.changes.is_empty()
+        self.changes.is_empty() || self.changes == [Operation::Retain(self.len)]
     }
 
-    /// Map a position through the changes.
+    /// Map a (mostly) *sorted* list of positions through the changes.
     ///
-    /// `assoc` indicates which size to associate the position with. `Before` will keep the
-    /// position close to the character before, and will place it before insertions over that
-    /// range, or at that point. `After` will move it forward, placing it at the end of such
-    /// insertions.
-    pub fn map_pos(&self, pos: usize, assoc: Assoc) -> usize {
+    /// This is equivalent to updating each position with `map_pos`:
+    ///
+    /// ``` no-compile
+    /// for (pos, assoc) in positions {
+    ///     *pos = changes.map_pos(*pos, assoc);
+    /// }
+    /// ```
+    /// However this function is significantly faster for sorted lists running
+    /// in `O(N+M)` instead of `O(NM)`. This function also handles unsorted/
+    /// partially sorted lists. However, in that case worst case complexity is
+    /// again `O(MN)`.  For lists that are often/mostly sorted (like the end of diagnostic ranges)
+    /// performance is usally close to `O(N + M)`
+    pub fn update_positions<'a>(&self, positions: impl Iterator<Item = (&'a mut usize, Assoc)>) {
         use Operation::*;
+
+        let mut positions = positions.peekable();
+
         let mut old_pos = 0;
         let mut new_pos = 0;
+        let mut iter = self.changes.iter().enumerate().peekable();
 
-        let mut iter = self.changes.iter().peekable();
+        'outer: loop {
+            macro_rules! map {
+                ($map: expr, $i: expr) => {
+                    loop {
+                        let Some((pos, assoc)) = positions.peek_mut() else {
+                            return;
+                        };
+                        if **pos < old_pos {
+                            // Positions are not sorted, revert to the last Operation that
+                            // contains this position and continue iterating from there.
+                            // We can unwrap here since `pos` can not be negative
+                            // (unsigned integer) and iterating backwards to the start
+                            // should always move us back to the start
+                            for (i, change) in self.changes[..$i].iter().enumerate().rev() {
+                                match change {
+                                    Retain(i) => {
+                                        old_pos -= i;
+                                        new_pos -= i;
+                                    }
+                                    Delete(i) => {
+                                        old_pos -= i;
+                                    }
+                                    Insert(ins) => {
+                                        new_pos -= ins.chars().count();
+                                    }
+                                }
+                                if old_pos <= **pos {
+                                    iter = self.changes[i..].iter().enumerate().peekable();
+                                }
+                            }
+                            debug_assert!(old_pos <= **pos, "Reverse Iter across changeset works");
+                            continue 'outer;
+                        }
+                        #[allow(clippy::redundant_closure_call)]
+                        let Some(new_pos) = $map(**pos, *assoc) else {
+                            break;
+                        };
+                        **pos = new_pos;
+                        positions.next();
+                    }
+                };
+            }
 
-        while let Some(change) = iter.next() {
+            let Some((i, change)) = iter.next() else {
+                map!(
+                    |pos, _| (old_pos == pos).then_some(new_pos),
+                    self.changes.len()
+                );
+                break;
+            };
+
             let len = match change {
                 Delete(i) | Retain(i) => *i,
                 Insert(_) => 0,
@@ -355,61 +443,71 @@ impl ChangeSet {
 
             match change {
                 Retain(_) => {
-                    if old_end > pos {
-                        return new_pos + (pos - old_pos);
-                    }
+                    map!(
+                        |pos, _| (old_end > pos).then_some(new_pos + (pos - old_pos)),
+                        i
+                    );
                     new_pos += len;
                 }
                 Delete(_) => {
                     // in range
-                    if old_end > pos {
-                        return new_pos;
-                    }
+                    map!(|pos, _| (old_end > pos).then_some(new_pos), i);
                 }
                 Insert(s) => {
-                    let ins = s.chars().count();
-
                     // a subsequent delete means a replace, consume it
-                    if let Some(Delete(len)) = iter.peek() {
+                    if let Some((_, Delete(len))) = iter.peek() {
                         iter.next();
 
                         old_end = old_pos + len;
                         // in range of replaced text
-                        if old_end > pos {
-                            // at point or tracking before
-                            if pos == old_pos || assoc == Assoc::Before {
-                                return new_pos;
-                            } else {
-                                // place to end of insert
-                                return new_pos + ins;
-                            }
-                        }
+                        map!(
+                            |pos, assoc: Assoc| (old_end > pos).then(|| {
+                                // at point or tracking before
+                                if pos == old_pos && assoc.stay_at_gaps() {
+                                    new_pos
+                                } else {
+                                    let ins = assoc.insert_offset(s);
+                                    // if the deleted and inserted text have the exact same size
+                                    // keep the relative offset into the new text
+                                    if *len == ins && assoc.sticky() {
+                                        new_pos + (pos - old_pos)
+                                    } else {
+                                        new_pos + assoc.insert_offset(s)
+                                    }
+                                }
+                            }),
+                            i
+                        );
                     } else {
                         // at insert point
-                        if old_pos == pos {
-                            // return position before inserted text
-                            if assoc == Assoc::Before {
-                                return new_pos;
-                            } else {
-                                // after text
-                                return new_pos + ins;
-                            }
-                        }
+                        map!(
+                            |pos, assoc: Assoc| (old_pos == pos).then(|| {
+                                // return position before inserted text
+                                new_pos + assoc.insert_offset(s)
+                            }),
+                            i
+                        );
                     }
 
-                    new_pos += ins;
+                    new_pos += s.chars().count();
                 }
             }
             old_pos = old_end;
         }
+        let out_of_bounds: Vec<_> = positions.collect();
 
-        if pos > old_pos {
-            panic!(
-                "Position {} is out of range for changeset len {}!",
-                pos, old_pos
-            )
-        }
-        new_pos
+        panic!("Positions {out_of_bounds:?} are out of range for changeset len {old_pos}!",)
+    }
+
+    /// Map a position through the changes.
+    ///
+    /// `assoc` indicates which side to associate the position with. `Before` will keep the
+    /// position close to the character before, and will place it before insertions over that
+    /// range, or at that point. `After` will move it forward, placing it at the end of such
+    /// insertions.
+    pub fn map_pos(&self, mut pos: usize, assoc: Assoc) -> usize {
+        self.update_positions(once((&mut pos, assoc)));
+        pos
     }
 
     pub fn changes_iter(&self) -> ChangeIterator {
@@ -419,19 +517,17 @@ impl ChangeSet {
 
 /// Transaction represents a single undoable unit of changes. Several changes can be grouped into
 /// a single transaction.
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Transaction {
     changes: ChangeSet,
     selection: Option<Selection>,
-    // effects, annotations
-    // scroll_into_view
 }
 
 impl Transaction {
     /// Create a new, empty transaction.
     pub fn new(doc: &Rope) -> Self {
         Self {
-            changes: ChangeSet::new(doc),
+            changes: ChangeSet::new(doc.slice(..)),
             selection: None,
         }
     }
@@ -448,14 +544,12 @@ impl Transaction {
 
     /// Returns true if applied successfully.
     pub fn apply(&self, doc: &mut Rope) -> bool {
-        if !self.changes.is_empty() {
-            // apply changes to the document
-            if !self.changes.apply(doc) {
-                return false;
-            }
+        if self.changes.is_empty() {
+            return true;
         }
 
-        true
+        // apply changes to the document
+        self.changes.apply(doc)
     }
 
     /// Generate a transaction that reverts this one.
@@ -480,10 +574,37 @@ impl Transaction {
         self
     }
 
+    /// Generate a transaction from a set of potentially overlapping changes. The `change_ranges`
+    /// iterator yield the range (of removed text) in the old document for each edit. If any change
+    /// overlaps with a range overlaps with a previous range then that range is ignored.
+    ///
+    /// The `process_change` callback is called for each edit that is not ignored (in the order
+    /// yielded by `changes`) and should return the new text that the associated range will be
+    /// replaced with.
+    ///
+    /// To make this function more flexible the iterator can yield additional data for each change
+    /// that is passed to `process_change`
+    pub fn change_ignore_overlapping<T>(
+        doc: &Rope,
+        change_ranges: impl Iterator<Item = (usize, usize, T)>,
+        mut process_change: impl FnMut(usize, usize, T) -> Option<Tendril>,
+    ) -> Self {
+        let mut last = 0;
+        let changes = change_ranges.filter_map(|(from, to, data)| {
+            if from < last {
+                return None;
+            }
+            let tendril = process_change(from, to, data);
+            last = to;
+            Some((from, to, tendril))
+        });
+        Self::change(doc, changes)
+    }
+
     /// Generate a transaction from a set of changes.
     pub fn change<I>(doc: &Rope, changes: I) -> Self
     where
-        I: IntoIterator<Item = Change> + Iterator,
+        I: Iterator<Item = Change>,
     {
         let len = doc.len_chars();
 
@@ -491,12 +612,16 @@ impl Transaction {
         let size = upper.unwrap_or(lower);
         let mut changeset = ChangeSet::with_capacity(2 * size + 1); // rough estimate
 
-        // TODO: verify ranges are ordered and not overlapping or change will panic.
-
-        // TODO: test for (pos, pos, None) to factor out as nothing
-
         let mut last = 0;
         for (from, to, tendril) in changes {
+            // Verify ranges are ordered and not overlapping
+            debug_assert!(last <= from);
+            // Verify ranges are correct
+            debug_assert!(
+                from <= to,
+                "Edit end must end before it starts (should {from} <= {to})"
+            );
+
             // Retain from last "to" to current "from"
             changeset.retain(from - last);
             let span = to - from;
@@ -515,12 +640,100 @@ impl Transaction {
         Self::from(changeset)
     }
 
+    /// Generate a transaction from a set of potentially overlapping deletions
+    /// by merging overlapping deletions together.
+    pub fn delete<I>(doc: &Rope, deletions: I) -> Self
+    where
+        I: Iterator<Item = Deletion>,
+    {
+        let len = doc.len_chars();
+
+        let (lower, upper) = deletions.size_hint();
+        let size = upper.unwrap_or(lower);
+        let mut changeset = ChangeSet::with_capacity(2 * size + 1); // rough estimate
+
+        let mut last = 0;
+        for (mut from, to) in deletions {
+            if last > to {
+                continue;
+            }
+            if last > from {
+                from = last
+            }
+            debug_assert!(
+                from <= to,
+                "Edit end must end before it starts (should {from} <= {to})"
+            );
+            // Retain from last "to" to current "from"
+            changeset.retain(from - last);
+            changeset.delete(to - from);
+            last = to;
+        }
+
+        changeset.retain(len - last);
+
+        Self::from(changeset)
+    }
+
+    pub fn insert_at_eof(mut self, text: Tendril) -> Transaction {
+        self.changes.insert(text);
+        self
+    }
+
     /// Generate a transaction with a change per selection range.
     pub fn change_by_selection<F>(doc: &Rope, selection: &Selection, f: F) -> Self
     where
         F: FnMut(&Range) -> Change,
     {
         Self::change(doc, selection.iter().map(f))
+    }
+
+    pub fn change_by_selection_ignore_overlapping(
+        doc: &Rope,
+        selection: &Selection,
+        mut change_range: impl FnMut(&Range) -> (usize, usize),
+        mut create_tendril: impl FnMut(usize, usize) -> Option<Tendril>,
+    ) -> (Transaction, Selection) {
+        let mut last_selection_idx = None;
+        let mut new_primary_idx = None;
+        let mut ranges: SmallVec<[Range; 1]> = SmallVec::new();
+        let process_change = |change_start, change_end, (idx, range): (usize, &Range)| {
+            // update the primary idx
+            if idx == selection.primary_index() {
+                new_primary_idx = Some(idx);
+            } else if new_primary_idx.is_none() {
+                if idx > selection.primary_index() {
+                    new_primary_idx = last_selection_idx;
+                } else {
+                    last_selection_idx = Some(idx);
+                }
+            }
+            ranges.push(*range);
+            create_tendril(change_start, change_end)
+        };
+        let transaction = Self::change_ignore_overlapping(
+            doc,
+            selection.iter().enumerate().map(|range| {
+                let (change_start, change_end) = change_range(range.1);
+                (change_start, change_end, range)
+            }),
+            process_change,
+        );
+
+        (
+            transaction,
+            Selection::new(ranges, new_primary_idx.unwrap_or(0)),
+        )
+    }
+
+    /// Generate a transaction with a deletion per selection range.
+    /// Compared to using `change_by_selection` directly these ranges may overlap.
+    /// In that case they are merged
+    pub fn delete_by_selection<F>(doc: &Rope, selection: &Selection, f: F) -> Self
+    where
+        F: FnMut(&Range) -> Deletion,
+    {
+        Self::delete(doc, selection.iter().map(f))
     }
 
     /// Insert text at each selection head.
@@ -556,7 +769,7 @@ impl<'a> ChangeIterator<'a> {
     }
 }
 
-impl<'a> Iterator for ChangeIterator<'a> {
+impl Iterator for ChangeIterator<'_> {
     type Item = Change;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -592,7 +805,7 @@ impl<'a> Iterator for ChangeIterator<'a> {
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::State;
+    use crate::history::State;
 
     #[test]
     fn composition() {
@@ -695,6 +908,62 @@ mod test {
         };
         assert_eq!(cs.map_pos(2, Assoc::Before), 2);
         assert_eq!(cs.map_pos(2, Assoc::After), 2);
+        // unsorted selection
+        let cs = ChangeSet {
+            changes: vec![
+                Insert("ab".into()),
+                Delete(2),
+                Insert("cd".into()),
+                Delete(2),
+            ],
+            len: 4,
+            len_after: 4,
+        };
+        let mut positions = [4, 2];
+        cs.update_positions(positions.iter_mut().map(|pos| (pos, Assoc::After)));
+        assert_eq!(positions, [4, 2]);
+        // stays at word boundary
+        let cs = ChangeSet {
+            changes: vec![
+                Retain(2), // <space><space>
+                Insert(" ab".into()),
+                Retain(2), // cd
+                Insert("de ".into()),
+            ],
+            len: 4,
+            len_after: 10,
+        };
+        assert_eq!(cs.map_pos(2, Assoc::BeforeWord), 3);
+        assert_eq!(cs.map_pos(4, Assoc::AfterWord), 9);
+        let cs = ChangeSet {
+            changes: vec![
+                Retain(1), // <space>
+                Insert(" b".into()),
+                Delete(1), // c
+                Retain(1), // d
+                Insert("e ".into()),
+                Delete(1), // <space>
+            ],
+            len: 5,
+            len_after: 7,
+        };
+        assert_eq!(cs.map_pos(1, Assoc::BeforeWord), 2);
+        assert_eq!(cs.map_pos(3, Assoc::AfterWord), 5);
+        let cs = ChangeSet {
+            changes: vec![
+                Retain(1), // <space>
+                Insert("a".into()),
+                Delete(2), // <space>b
+                Retain(1), // d
+                Insert("e".into()),
+                Delete(1), // f
+                Retain(1), // <space>
+            ],
+            len: 5,
+            len_after: 7,
+        };
+        assert_eq!(cs.map_pos(2, Assoc::BeforeWord), 1);
+        assert_eq!(cs.map_pos(4, Assoc::AfterWord), 4);
     }
 
     #[test]
@@ -702,7 +971,7 @@ mod test {
         let mut doc = Rope::from("hello world!\ntest 123");
         let transaction = Transaction::change(
             &doc,
-            // (1, 1, None) is a useless 0-width delete
+            // (1, 1, None) is a useless 0-width delete that gets factored out
             vec![(1, 1, None), (6, 11, Some("void".into())), (12, 17, None)].into_iter(),
         );
         transaction.apply(&mut doc);
@@ -719,20 +988,23 @@ mod test {
 
     #[test]
     fn optimized_composition() {
-        let mut state = State::new("".into());
-        let t1 = Transaction::insert(&state.doc, &state.selection, Tendril::from_char('h'));
+        let mut state = State {
+            doc: "".into(),
+            selection: Selection::point(0),
+        };
+        let t1 = Transaction::insert(&state.doc, &state.selection, Tendril::from("h"));
         t1.apply(&mut state.doc);
         state.selection = state.selection.clone().map(t1.changes());
-        let t2 = Transaction::insert(&state.doc, &state.selection, Tendril::from_char('e'));
+        let t2 = Transaction::insert(&state.doc, &state.selection, Tendril::from("e"));
         t2.apply(&mut state.doc);
         state.selection = state.selection.clone().map(t2.changes());
-        let t3 = Transaction::insert(&state.doc, &state.selection, Tendril::from_char('l'));
+        let t3 = Transaction::insert(&state.doc, &state.selection, Tendril::from("l"));
         t3.apply(&mut state.doc);
         state.selection = state.selection.clone().map(t3.changes());
-        let t4 = Transaction::insert(&state.doc, &state.selection, Tendril::from_char('l'));
+        let t4 = Transaction::insert(&state.doc, &state.selection, Tendril::from("l"));
         t4.apply(&mut state.doc);
         state.selection = state.selection.clone().map(t4.changes());
-        let t5 = Transaction::insert(&state.doc, &state.selection, Tendril::from_char('o'));
+        let t5 = Transaction::insert(&state.doc, &state.selection, Tendril::from("o"));
         t5.apply(&mut state.doc);
         state.selection = state.selection.clone().map(t5.changes());
 
@@ -758,9 +1030,9 @@ mod test {
     #[test]
     fn combine_with_empty() {
         let empty = Rope::from("");
-        let a = ChangeSet::new(&empty);
+        let a = ChangeSet::new(empty.slice(..));
 
-        let mut b = ChangeSet::new(&empty);
+        let mut b = ChangeSet::new(empty.slice(..));
         b.insert("a".into());
 
         let changes = a.compose(b);
@@ -771,12 +1043,12 @@ mod test {
 
     #[test]
     fn combine_with_utf8() {
-        const TEST_CASE: &'static str = "Hello, これはヘリックスエディターです！";
+        const TEST_CASE: &str = "Hello, これはヘリックスエディターです！";
 
         let empty = Rope::from("");
-        let a = ChangeSet::new(&empty);
+        let a = ChangeSet::new(empty.slice(..));
 
-        let mut b = ChangeSet::new(&empty);
+        let mut b = ChangeSet::new(empty.slice(..));
         b.insert(TEST_CASE.into());
 
         let changes = a.compose(b);
