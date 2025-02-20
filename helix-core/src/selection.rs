@@ -7,10 +7,15 @@ use crate::{
         ensure_grapheme_boundary_next, ensure_grapheme_boundary_prev, next_grapheme_boundary,
         prev_grapheme_boundary,
     },
+    line_ending::get_line_ending,
+    movement::Direction,
     Assoc, ChangeSet, RopeSlice,
 };
+use helix_stdx::range::is_subset;
+use helix_stdx::rope::{self, RopeSliceExt};
 use smallvec::{smallvec, SmallVec};
-use std::borrow::Cow;
+use std::{borrow::Cow, iter, slice};
+use tree_sitter::Node;
 
 /// A single selection range.
 ///
@@ -20,14 +25,14 @@ use std::borrow::Cow;
 /// can be in any order, or even share the same position.
 ///
 /// The anchor and head positions use gap indexing, meaning
-/// that their indices represent the the gaps *between* `char`s
+/// that their indices represent the gaps *between* `char`s
 /// rather than the `char`s themselves. For example, 1
 /// represents the position between the first and second `char`.
 ///
-/// Below are some example `Range` configurations to better
-/// illustrate.  The anchor and head indices are show as
-/// "(anchor, head)", followed by example text with "[" and "]"
-/// inserted to represent the anchor and head positions:
+/// Below are some examples of `Range` configurations.
+/// The anchor and head indices are shown as "(anchor, head)"
+/// tuples, followed by example text with "[" and "]" symbols
+/// representing the anchor and head positions:
 ///
 /// - (0, 3): `[Som]e text`.
 /// - (3, 0): `]Som[e text`.
@@ -37,7 +42,7 @@ use std::borrow::Cow;
 /// Ranges are considered to be inclusive on the left and
 /// exclusive on the right, regardless of anchor-head ordering.
 /// This means, for example, that non-zero-width ranges that
-/// are directly adjecent, sharing an edge, do not overlap.
+/// are directly adjacent, sharing an edge, do not overlap.
 /// However, a zero-width range will overlap with the shared
 /// left-edge of another range.
 ///
@@ -52,7 +57,9 @@ pub struct Range {
     pub anchor: usize,
     /// The head of the range, moved when extending.
     pub head: usize,
-    pub horiz: Option<u32>,
+    /// The previous visual offset (softwrapped lines and columns) from
+    /// the start of the line
+    pub old_visual_position: Option<(u32, u32)>,
 }
 
 impl Range {
@@ -60,12 +67,18 @@ impl Range {
         Self {
             anchor,
             head,
-            horiz: None,
+            old_visual_position: None,
         }
     }
 
     pub fn point(head: usize) -> Self {
         Self::new(head, head)
+    }
+
+    pub fn from_node(node: Node, text: RopeSlice, direction: Direction) -> Self {
+        let from = text.byte_to_char(node.start_byte());
+        let to = text.byte_to_char(node.end_byte());
+        Range::new(from, to).with_direction(direction)
     }
 
     /// Start of the range.
@@ -80,6 +93,13 @@ impl Range {
     #[must_use]
     pub fn to(&self) -> usize {
         std::cmp::max(self.anchor, self.head)
+    }
+
+    /// Total length of the range.
+    #[inline]
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.to() - self.from()
     }
 
     /// The (inclusive) range of lines that the range overlaps.
@@ -102,6 +122,37 @@ impl Range {
         self.anchor == self.head
     }
 
+    /// `Direction::Backward` when head < anchor.
+    /// `Direction::Forward` otherwise.
+    #[inline]
+    #[must_use]
+    pub fn direction(&self) -> Direction {
+        if self.head < self.anchor {
+            Direction::Backward
+        } else {
+            Direction::Forward
+        }
+    }
+
+    /// Flips the direction of the selection
+    pub fn flip(&self) -> Self {
+        Self {
+            anchor: self.head,
+            head: self.anchor,
+            old_visual_position: self.old_visual_position,
+        }
+    }
+
+    /// Returns the selection if it goes in the direction of `direction`,
+    /// flipping the selection otherwise.
+    pub fn with_direction(self, direction: Direction) -> Self {
+        if self.direction() == direction {
+            self
+        } else {
+            self.flip()
+        }
+    }
+
     /// Check two ranges for overlap.
     #[must_use]
     pub fn overlaps(&self, other: &Self) -> bool {
@@ -111,38 +162,44 @@ impl Range {
         self.from() == other.from() || (self.to() > other.from() && other.to() > self.from())
     }
 
+    #[inline]
+    pub fn contains_range(&self, other: &Self) -> bool {
+        self.from() <= other.from() && self.to() >= other.to()
+    }
+
     pub fn contains(&self, pos: usize) -> bool {
         self.from() <= pos && pos < self.to()
     }
 
-    /// Map a range through a set of changes. Returns a new range representing the same position
-    /// after the changes are applied.
-    pub fn map(self, changes: &ChangeSet) -> Self {
+    /// Map a range through a set of changes. Returns a new range representing
+    /// the same position after the changes are applied. Note that this
+    /// function runs in O(N) (N is number of changes) and can therefore
+    /// cause performance problems if run for a large number of ranges as the
+    /// complexity is then O(MN) (for multicuror M=N usually). Instead use
+    /// [Selection::map] or [ChangeSet::update_positions].
+    pub fn map(mut self, changes: &ChangeSet) -> Self {
         use std::cmp::Ordering;
-        let (anchor, head) = match self.anchor.cmp(&self.head) {
-            Ordering::Equal => (
-                changes.map_pos(self.anchor, Assoc::After),
-                changes.map_pos(self.head, Assoc::After),
-            ),
-            Ordering::Less => (
-                changes.map_pos(self.anchor, Assoc::After),
-                changes.map_pos(self.head, Assoc::Before),
-            ),
-            Ordering::Greater => (
-                changes.map_pos(self.anchor, Assoc::Before),
-                changes.map_pos(self.head, Assoc::After),
-            ),
-        };
-
-        // We want to return a new `Range` with `horiz == None` every time,
-        // even if the anchor and head haven't changed, because we don't
-        // know if the *visual* position hasn't changed due to
-        // character-width or grapheme changes earlier in the text.
-        Self {
-            anchor,
-            head,
-            horiz: None,
+        if changes.is_empty() {
+            return self;
         }
+
+        let positions_to_map = match self.anchor.cmp(&self.head) {
+            Ordering::Equal => [
+                (&mut self.anchor, Assoc::AfterSticky),
+                (&mut self.head, Assoc::AfterSticky),
+            ],
+            Ordering::Less => [
+                (&mut self.anchor, Assoc::AfterSticky),
+                (&mut self.head, Assoc::BeforeSticky),
+            ],
+            Ordering::Greater => [
+                (&mut self.head, Assoc::AfterSticky),
+                (&mut self.anchor, Assoc::BeforeSticky),
+            ],
+        };
+        changes.update_positions(positions_to_map.into_iter());
+        self.old_visual_position = None;
+        self
     }
 
     /// Extend the range to cover at least `from` `to`.
@@ -154,13 +211,13 @@ impl Range {
             Self {
                 anchor: self.anchor.min(from),
                 head: self.head.max(to),
-                horiz: None,
+                old_visual_position: None,
             }
         } else {
             Self {
                 anchor: self.anchor.max(to),
                 head: self.head.min(from),
-                horiz: None,
+                old_visual_position: None,
             }
         }
     }
@@ -175,22 +232,36 @@ impl Range {
             Range {
                 anchor: self.anchor.max(other.anchor),
                 head: self.head.min(other.head),
-                horiz: None,
+                old_visual_position: None,
             }
         } else {
             Range {
                 anchor: self.from().min(other.from()),
                 head: self.to().max(other.to()),
-                horiz: None,
+                old_visual_position: None,
             }
         }
     }
 
     // groupAt
 
+    /// Returns the text inside this range given the text of the whole buffer.
+    ///
+    /// The returned `Cow` is a reference if the range of text is inside a single
+    /// chunk of the rope. Otherwise a copy of the text is returned. Consider
+    /// using `slice` instead if you do not need a `Cow` or `String` to avoid copying.
     #[inline]
     pub fn fragment<'a, 'b: 'a>(&'a self, text: RopeSlice<'b>) -> Cow<'b, str> {
-        text.slice(self.from()..self.to()).into()
+        self.slice(text).into()
+    }
+
+    /// Returns the text inside this range given the text of the whole buffer.
+    ///
+    /// The returned value is a reference to the passed slice. This method never
+    /// copies any contents.
+    #[inline]
+    pub fn slice<'a, 'b: 'a>(&'a self, text: RopeSlice<'b>) -> RopeSlice<'b> {
+        text.slice(self.from()..self.to())
     }
 
     //--------------------------------
@@ -221,8 +292,8 @@ impl Range {
         Range {
             anchor: new_anchor,
             head: new_head,
-            horiz: if new_anchor == self.anchor {
-                self.horiz
+            old_visual_position: if new_anchor == self.anchor {
+                self.old_visual_position
             } else {
                 None
             },
@@ -248,7 +319,7 @@ impl Range {
             Range {
                 anchor: self.anchor,
                 head: next_grapheme_boundary(slice, self.head),
-                horiz: self.horiz,
+                old_visual_position: self.old_visual_position,
             }
         } else {
             *self
@@ -305,6 +376,20 @@ impl Range {
     pub fn cursor_line(&self, text: RopeSlice) -> usize {
         text.char_to_line(self.cursor(text))
     }
+
+    /// Returns true if this Range covers a single grapheme in the given text
+    pub fn is_single_grapheme(&self, doc: RopeSlice) -> bool {
+        let mut graphemes = doc.slice(self.from()..self.to()).graphemes();
+        let first = graphemes.next();
+        let second = graphemes.next();
+        first.is_some() && second.is_none()
+    }
+
+    /// Converts this char range into an in order byte range, discarding
+    /// direction.
+    pub fn into_byte_range(&self, text: RopeSlice) -> (usize, usize) {
+        (text.char_to_byte(self.from()), text.char_to_byte(self.to()))
+    }
 }
 
 impl From<(usize, usize)> for Range {
@@ -312,7 +397,16 @@ impl From<(usize, usize)> for Range {
         Self {
             anchor,
             head,
-            horiz: None,
+            old_visual_position: None,
+        }
+    }
+}
+
+impl From<Range> for helix_stdx::Range {
+    fn from(range: Range) -> Self {
+        Self {
+            start: range.from(),
+            end: range.to(),
         }
     }
 }
@@ -383,21 +477,54 @@ impl Selection {
     /// Map selections over a set of changes. Useful for adjusting the selection position after
     /// applying changes to a document.
     pub fn map(self, changes: &ChangeSet) -> Self {
+        self.map_no_normalize(changes).normalize()
+    }
+
+    /// Map selections over a set of changes. Useful for adjusting the selection position after
+    /// applying changes to a document. Doesn't normalize the selection
+    pub fn map_no_normalize(mut self, changes: &ChangeSet) -> Self {
         if changes.is_empty() {
             return self;
         }
 
-        Self::new(
-            self.ranges
-                .into_iter()
-                .map(|range| range.map(changes))
-                .collect(),
-            self.primary_index,
-        )
+        let positions_to_map = self.ranges.iter_mut().flat_map(|range| {
+            use std::cmp::Ordering;
+            range.old_visual_position = None;
+            match range.anchor.cmp(&range.head) {
+                Ordering::Equal => [
+                    (&mut range.anchor, Assoc::AfterSticky),
+                    (&mut range.head, Assoc::AfterSticky),
+                ],
+                Ordering::Less => [
+                    (&mut range.anchor, Assoc::AfterSticky),
+                    (&mut range.head, Assoc::BeforeSticky),
+                ],
+                Ordering::Greater => [
+                    (&mut range.head, Assoc::AfterSticky),
+                    (&mut range.anchor, Assoc::BeforeSticky),
+                ],
+            }
+        });
+        changes.update_positions(positions_to_map);
+        self
     }
 
     pub fn ranges(&self) -> &[Range] {
         &self.ranges
+    }
+
+    /// Returns an iterator over the line ranges of each range in the selection.
+    ///
+    /// Adjacent and overlapping line ranges of the [Range]s in the selection are merged.
+    pub fn line_ranges<'a>(&'a self, text: RopeSlice<'a>) -> LineRangeIter<'a> {
+        LineRangeIter {
+            ranges: self.ranges.iter().peekable(),
+            text,
+        }
+    }
+
+    pub fn range_bounds(&self) -> impl Iterator<Item = helix_stdx::Range> + '_ {
+        self.ranges.iter().map(|&range| range.into())
     }
 
     pub fn primary_index(&self) -> usize {
@@ -416,7 +543,7 @@ impl Selection {
             ranges: smallvec![Range {
                 anchor,
                 head,
-                horiz: None
+                old_visual_position: None
             }],
             primary_index: 0,
         }
@@ -428,60 +555,101 @@ impl Selection {
     }
 
     /// Normalizes a `Selection`.
+    ///
+    /// Ranges are sorted by [Range::from], with overlapping ranges merged.
     fn normalize(mut self) -> Self {
-        let primary = self.ranges[self.primary_index];
+        if self.len() < 2 {
+            return self;
+        }
+        let mut primary = self.ranges[self.primary_index];
         self.ranges.sort_unstable_by_key(Range::from);
+
+        self.ranges.dedup_by(|curr_range, prev_range| {
+            if prev_range.overlaps(curr_range) {
+                let new_range = curr_range.merge(*prev_range);
+                if prev_range == &primary || curr_range == &primary {
+                    primary = new_range;
+                }
+                *prev_range = new_range;
+                true
+            } else {
+                false
+            }
+        });
+
         self.primary_index = self
             .ranges
             .iter()
             .position(|&range| range == primary)
             .unwrap();
 
-        let mut prev_i = 0;
-        for i in 1..self.ranges.len() {
-            if self.ranges[prev_i].overlaps(&self.ranges[i]) {
-                self.ranges[prev_i] = self.ranges[prev_i].merge(self.ranges[i]);
-            } else {
-                prev_i += 1;
-                self.ranges[prev_i] = self.ranges[i];
-            }
-            if i == self.primary_index {
-                self.primary_index = prev_i;
-            }
-        }
+        self
+    }
 
-        self.ranges.truncate(prev_i + 1);
+    /// Replaces ranges with one spanning from first to last range.
+    pub fn merge_ranges(self) -> Self {
+        let first = self.ranges.first().unwrap();
+        let last = self.ranges.last().unwrap();
+        Selection::new(smallvec![first.merge(*last)], 0)
+    }
+
+    /// Merges all ranges that are consecutive.
+    pub fn merge_consecutive_ranges(mut self) -> Self {
+        let mut primary = self.ranges[self.primary_index];
+
+        self.ranges.dedup_by(|curr_range, prev_range| {
+            if prev_range.to() == curr_range.from() {
+                let new_range = curr_range.merge(*prev_range);
+                if prev_range == &primary || curr_range == &primary {
+                    primary = new_range;
+                }
+                *prev_range = new_range;
+                true
+            } else {
+                false
+            }
+        });
+
+        self.primary_index = self
+            .ranges
+            .iter()
+            .position(|&range| range == primary)
+            .unwrap();
 
         self
     }
 
-    // TODO: consume an iterator or a vec to reduce allocations?
     #[must_use]
     pub fn new(ranges: SmallVec<[Range; 1]>, primary_index: usize) -> Self {
         assert!(!ranges.is_empty());
         debug_assert!(primary_index < ranges.len());
 
-        let mut selection = Self {
+        let selection = Self {
             ranges,
             primary_index,
         };
 
-        if selection.ranges.len() > 1 {
-            // TODO: only normalize if needed (any ranges out of order)
-            selection = selection.normalize();
-        }
-
-        selection
+        selection.normalize()
     }
 
     /// Takes a closure and maps each `Range` over the closure.
-    pub fn transform<F>(mut self, f: F) -> Self
+    pub fn transform<F>(mut self, mut f: F) -> Self
     where
-        F: Fn(Range) -> Range,
+        F: FnMut(Range) -> Range,
     {
         for range in self.ranges.iter_mut() {
             *range = f(*range)
         }
+        self.normalize()
+    }
+
+    /// Takes a closure and maps each `Range` over the closure to multiple `Range`s.
+    pub fn transform_iter<F, I>(mut self, f: F) -> Self
+    where
+        F: FnMut(Range) -> I,
+        I: Iterator<Item = Range>,
+    {
+        self.ranges = self.ranges.into_iter().flat_map(f).collect();
         self.normalize()
     }
 
@@ -502,8 +670,20 @@ impl Selection {
         self.transform(|range| Range::point(range.cursor(text)))
     }
 
-    pub fn fragments<'a>(&'a self, text: RopeSlice<'a>) -> impl Iterator<Item = Cow<str>> + 'a {
+    pub fn fragments<'a>(
+        &'a self,
+        text: RopeSlice<'a>,
+    ) -> impl DoubleEndedIterator<Item = Cow<'a, str>> + ExactSizeIterator<Item = Cow<'a, str>>
+    {
         self.ranges.iter().map(move |range| range.fragment(text))
+    }
+
+    pub fn slices<'a>(
+        &'a self,
+        text: RopeSlice<'a>,
+    ) -> impl DoubleEndedIterator<Item = RopeSlice<'a>> + ExactSizeIterator<Item = RopeSlice<'a>> + 'a
+    {
+        self.ranges.iter().map(move |range| range.slice(text))
     }
 
     #[inline(always)]
@@ -514,6 +694,11 @@ impl Selection {
     #[inline(always)]
     pub fn len(&self) -> usize {
         self.ranges.len()
+    }
+
+    /// returns true if self ⊇ other
+    pub fn contains(&self, other: &Selection) -> bool {
+        is_subset::<true>(self.range_bounds(), other.range_bounds())
     }
 }
 
@@ -526,17 +711,68 @@ impl<'a> IntoIterator for &'a Selection {
     }
 }
 
+impl IntoIterator for Selection {
+    type Item = Range;
+    type IntoIter = smallvec::IntoIter<[Range; 1]>;
+
+    fn into_iter(self) -> smallvec::IntoIter<[Range; 1]> {
+        self.ranges.into_iter()
+    }
+}
+
+impl FromIterator<Range> for Selection {
+    fn from_iter<T: IntoIterator<Item = Range>>(ranges: T) -> Self {
+        Self::new(ranges.into_iter().collect(), 0)
+    }
+}
+
+impl From<Range> for Selection {
+    fn from(range: Range) -> Self {
+        Self {
+            ranges: smallvec![range],
+            primary_index: 0,
+        }
+    }
+}
+
+pub struct LineRangeIter<'a> {
+    ranges: iter::Peekable<slice::Iter<'a, Range>>,
+    text: RopeSlice<'a>,
+}
+
+impl Iterator for LineRangeIter<'_> {
+    type Item = (usize, usize);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let (start, mut end) = self.ranges.next()?.line_range(self.text);
+        while let Some((next_start, next_end)) =
+            self.ranges.peek().map(|range| range.line_range(self.text))
+        {
+            // Merge overlapping and adjacent ranges.
+            // This subtraction cannot underflow because the ranges are sorted.
+            if next_start - end <= 1 {
+                end = next_end;
+                self.ranges.next();
+            } else {
+                break;
+            }
+        }
+
+        Some((start, end))
+    }
+}
+
 // TODO: checkSelection -> check if valid for doc length && sorted
 
 pub fn keep_or_remove_matches(
     text: RopeSlice,
     selection: &Selection,
-    regex: &crate::regex::Regex,
+    regex: &rope::Regex,
     remove: bool,
 ) -> Option<Selection> {
     let result: SmallVec<_> = selection
         .iter()
-        .filter(|range| regex.is_match(&range.fragment(text)) ^ remove)
+        .filter(|range| regex.is_match(text.regex_input_at(range.from()..range.to())) ^ remove)
         .copied()
         .collect();
 
@@ -547,26 +783,27 @@ pub fn keep_or_remove_matches(
     None
 }
 
+// TODO: support to split on capture #N instead of whole match
 pub fn select_on_matches(
     text: RopeSlice,
     selection: &Selection,
-    regex: &crate::regex::Regex,
+    regex: &rope::Regex,
 ) -> Option<Selection> {
     let mut result = SmallVec::with_capacity(selection.len());
 
     for sel in selection {
-        // TODO: can't avoid occasional allocations since Regex can't operate on chunks yet
-        let fragment = sel.fragment(text);
-
-        let sel_start = sel.from();
-        let start_byte = text.char_to_byte(sel_start);
-
-        for mat in regex.find_iter(&fragment) {
+        for mat in regex.find_iter(text.regex_input_at(sel.from()..sel.to())) {
             // TODO: retain range direction
 
-            let start = text.byte_to_char(start_byte + mat.start());
-            let end = text.byte_to_char(start_byte + mat.end());
-            result.push(Range::new(start, end));
+            let start = text.byte_to_char(mat.start());
+            let end = text.byte_to_char(mat.end());
+
+            let range = Range::new(start, end);
+            // Make sure the match is not right outside of the selection.
+            // These invalid matches can come from using RegEx anchors like `^`, `$`
+            if range != Range::point(sel.to()) {
+                result.push(range);
+            }
         }
     }
 
@@ -578,12 +815,7 @@ pub fn select_on_matches(
     None
 }
 
-// TODO: support to split on capture #N instead of whole match
-pub fn split_on_matches(
-    text: RopeSlice,
-    selection: &Selection,
-    regex: &crate::regex::Regex,
-) -> Selection {
+pub fn split_on_newline(text: RopeSlice, selection: &Selection) -> Selection {
     let mut result = SmallVec::with_capacity(selection.len());
 
     for sel in selection {
@@ -593,21 +825,49 @@ pub fn split_on_matches(
             continue;
         }
 
-        // TODO: can't avoid occasional allocations since Regex can't operate on chunks yet
-        let fragment = sel.fragment(text);
-
         let sel_start = sel.from();
         let sel_end = sel.to();
 
-        let start_byte = text.char_to_byte(sel_start);
-
         let mut start = sel_start;
 
-        for mat in regex.find_iter(&fragment) {
+        for line in sel.slice(text).lines() {
+            let Some(line_ending) = get_line_ending(&line) else {
+                break;
+            };
+            let line_end = start + line.len_chars();
             // TODO: retain range direction
-            let end = text.byte_to_char(start_byte + mat.start());
+            result.push(Range::new(start, line_end - line_ending.len_chars()));
+            start = line_end;
+        }
+
+        if start < sel_end {
+            result.push(Range::new(start, sel_end));
+        }
+    }
+
+    // TODO: figure out a new primary index
+    Selection::new(result, 0)
+}
+
+pub fn split_on_matches(text: RopeSlice, selection: &Selection, regex: &rope::Regex) -> Selection {
+    let mut result = SmallVec::with_capacity(selection.len());
+
+    for sel in selection {
+        // Special case: zero-width selection.
+        if sel.from() == sel.to() {
+            result.push(*sel);
+            continue;
+        }
+
+        let sel_start = sel.from();
+        let sel_end = sel.to();
+        let mut start = sel_start;
+
+        for mat in regex.find_iter(text.regex_input_at(sel_start..sel_end)) {
+            // TODO: retain range direction
+            let end = text.byte_to_char(mat.start());
             result.push(Range::new(start, end));
-            start = text.byte_to_char(start_byte + mat.end());
+            start = text.byte_to_char(mat.end());
         }
 
         if start < sel_end {
@@ -699,16 +959,16 @@ mod test {
     fn test_contains() {
         let range = Range::new(10, 12);
 
-        assert_eq!(range.contains(9), false);
-        assert_eq!(range.contains(10), true);
-        assert_eq!(range.contains(11), true);
-        assert_eq!(range.contains(12), false);
-        assert_eq!(range.contains(13), false);
+        assert!(!range.contains(9));
+        assert!(range.contains(10));
+        assert!(range.contains(11));
+        assert!(!range.contains(12));
+        assert!(!range.contains(13));
 
         let range = Range::new(9, 6);
-        assert_eq!(range.contains(9), false);
-        assert_eq!(range.contains(7), true);
-        assert_eq!(range.contains(6), true);
+        assert!(!range.contains(9));
+        assert!(range.contains(7));
+        assert!(range.contains(6));
     }
 
     #[test]
@@ -763,7 +1023,7 @@ mod test {
     }
 
     #[test]
-    fn test_graphem_aligned() {
+    fn test_grapheme_aligned() {
         let r = Rope::from_str("\r\nHi\r\n");
         let s = r.slice(..);
 
@@ -837,6 +1097,80 @@ mod test {
     }
 
     #[test]
+    fn test_select_on_matches() {
+        let r = Rope::from_str("Nobody expects the Spanish inquisition");
+        let s = r.slice(..);
+
+        let selection = Selection::single(0, r.len_chars());
+        assert_eq!(
+            select_on_matches(s, &selection, &rope::Regex::new(r"[A-Z][a-z]*").unwrap()),
+            Some(Selection::new(
+                smallvec![Range::new(0, 6), Range::new(19, 26)],
+                0
+            ))
+        );
+
+        let r = Rope::from_str("This\nString\n\ncontains multiple\nlines");
+        let s = r.slice(..);
+
+        let start_of_line = rope::RegexBuilder::new()
+            .syntax(rope::Config::new().multi_line(true))
+            .build(r"^")
+            .unwrap();
+        let end_of_line = rope::RegexBuilder::new()
+            .syntax(rope::Config::new().multi_line(true))
+            .build(r"$")
+            .unwrap();
+
+        // line without ending
+        assert_eq!(
+            select_on_matches(s, &Selection::single(0, 4), &start_of_line),
+            Some(Selection::single(0, 0))
+        );
+        assert_eq!(
+            select_on_matches(s, &Selection::single(0, 4), &end_of_line),
+            None
+        );
+        // line with ending
+        assert_eq!(
+            select_on_matches(s, &Selection::single(0, 5), &start_of_line),
+            Some(Selection::single(0, 0))
+        );
+        assert_eq!(
+            select_on_matches(s, &Selection::single(0, 5), &end_of_line),
+            Some(Selection::single(4, 4))
+        );
+        // line with start of next line
+        assert_eq!(
+            select_on_matches(s, &Selection::single(0, 6), &start_of_line),
+            Some(Selection::new(
+                smallvec![Range::point(0), Range::point(5)],
+                0
+            ))
+        );
+        assert_eq!(
+            select_on_matches(s, &Selection::single(0, 6), &end_of_line),
+            Some(Selection::single(4, 4))
+        );
+
+        // multiple lines
+        assert_eq!(
+            select_on_matches(
+                s,
+                &Selection::single(0, s.len_chars()),
+                &rope::RegexBuilder::new()
+                    .syntax(rope::Config::new().multi_line(true))
+                    .build(r"^[a-z ]*$")
+                    .unwrap()
+            ),
+            Some(Selection::new(
+                smallvec![Range::point(12), Range::new(13, 30), Range::new(31, 36)],
+                0
+            ))
+        );
+    }
+
+    #[test]
     fn test_line_range() {
         let r = Rope::from_str("\r\nHi\r\nthere!");
         let s = r.slice(..);
@@ -864,6 +1198,32 @@ mod test {
         assert_eq!(Range::new(3, 2).line_range(s), (1, 1));
         assert_eq!(Range::new(8, 3).line_range(s), (1, 2));
         assert_eq!(Range::new(12, 0).line_range(s), (0, 2));
+    }
+
+    #[test]
+    fn selection_line_ranges() {
+        let (text, selection) = crate::test::print(
+            r#"                                           L0
+            #[|these]# line #(|ranges)# are #(|merged)#   L1
+                                                          L2
+            single one-line #(|range)#                    L3
+                                                          L4
+            single #(|multiline                           L5
+            range)#                                       L6
+                                                          L7
+            these #(|multiline                            L8
+            ranges)# are #(|also                          L9
+            merged)#                                      L10
+                                                          L11
+            adjacent #(|ranges)#                          L12
+            are merged #(|the same way)#                  L13
+            "#,
+        );
+        let rope = Rope::from_str(&text);
+        assert_eq!(
+            vec![(1, 1), (3, 3), (5, 6), (8, 10), (12, 13)],
+            selection.line_ranges(rope.slice(..)).collect::<Vec<_>>(),
+        );
     }
 
     #[test]
@@ -918,13 +1278,15 @@ mod test {
 
     #[test]
     fn test_split_on_matches() {
-        use crate::regex::Regex;
-
         let text = Rope::from(" abcd efg wrs   xyz 123 456");
 
         let selection = Selection::new(smallvec![Range::new(0, 9), Range::new(11, 20),], 0);
 
-        let result = split_on_matches(text.slice(..), &selection, &Regex::new(r"\s+").unwrap());
+        let result = split_on_matches(
+            text.slice(..),
+            &selection,
+            &rope::Regex::new(r"\s+").unwrap(),
+        );
 
         assert_eq!(
             result.ranges(),
@@ -952,5 +1314,83 @@ mod test {
             result.fragments(text.slice(..)).collect::<Vec<_>>(),
             &["", "abcd", "efg", "rs", "xyz"]
         );
+    }
+
+    #[test]
+    fn test_merge_consecutive_ranges() {
+        let selection = Selection::new(
+            smallvec![
+                Range::new(0, 1),
+                Range::new(1, 10),
+                Range::new(15, 20),
+                Range::new(25, 26),
+                Range::new(26, 30)
+            ],
+            4,
+        );
+
+        let result = selection.merge_consecutive_ranges();
+
+        assert_eq!(
+            result.ranges(),
+            &[Range::new(0, 10), Range::new(15, 20), Range::new(25, 30)]
+        );
+        assert_eq!(result.primary_index, 2);
+
+        let selection = Selection::new(smallvec![Range::new(0, 1)], 0);
+        let result = selection.merge_consecutive_ranges();
+
+        assert_eq!(result.ranges(), &[Range::new(0, 1)]);
+        assert_eq!(result.primary_index, 0);
+
+        let selection = Selection::new(
+            smallvec![
+                Range::new(0, 1),
+                Range::new(1, 5),
+                Range::new(5, 8),
+                Range::new(8, 10),
+                Range::new(10, 15),
+                Range::new(18, 25)
+            ],
+            3,
+        );
+
+        let result = selection.merge_consecutive_ranges();
+
+        assert_eq!(result.ranges(), &[Range::new(0, 15), Range::new(18, 25)]);
+        assert_eq!(result.primary_index, 0);
+    }
+
+    #[test]
+    fn test_selection_contains() {
+        fn contains(a: Vec<(usize, usize)>, b: Vec<(usize, usize)>) -> bool {
+            let sela = Selection::new(a.iter().map(|a| Range::new(a.0, a.1)).collect(), 0);
+            let selb = Selection::new(b.iter().map(|b| Range::new(b.0, b.1)).collect(), 0);
+            sela.contains(&selb)
+        }
+
+        // exact match
+        assert!(contains(vec!((1, 1)), vec!((1, 1))));
+
+        // larger set contains smaller
+        assert!(contains(vec!((1, 1), (2, 2), (3, 3)), vec!((2, 2))));
+
+        // multiple matches
+        assert!(contains(vec!((1, 1), (2, 2)), vec!((1, 1), (2, 2))));
+
+        // smaller set can't contain bigger
+        assert!(!contains(vec!((1, 1)), vec!((1, 1), (2, 2))));
+
+        assert!(contains(
+            vec!((1, 1), (2, 4), (5, 6), (7, 9), (10, 13)),
+            vec!((3, 4), (7, 9))
+        ));
+        assert!(!contains(vec!((1, 1), (5, 6)), vec!((1, 6))));
+
+        // multiple ranges of other are all contained in some ranges of self,
+        assert!(contains(
+            vec!((1, 4), (7, 10)),
+            vec!((1, 2), (3, 4), (7, 9))
+        ));
     }
 }

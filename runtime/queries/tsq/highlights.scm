@@ -1,46 +1,50 @@
-; mark the string passed #match? as a regex
-(((predicate_name) @function
-  (capture)
-  (string) @string.regexp)
- (#eq? @function "#match?"))
+((program
+  .
+  (comment)*
+  .
+  (comment) @keyword.import)
+  (#match? @keyword.import "^;+ *inherits *:"))
 
-; highlight inheritance comments
-((query . (comment) @keyword.directive)
- (#match? @keyword.directive "^;\ +inherits *:"))
+((parameters
+  (identifier) @constant.numeric)
+  (#match? @constant.numeric "^[-+]?[0-9]+(.[0-9]+)?$"))
 
-[
-  "("
-  ")"
-  "["
-  "]"
-] @punctuation.bracket
+"_" @constant
 
 ":" @punctuation.delimiter
 
 [
-  (one_or_more)
-  (zero_or_one)
-  (zero_or_more)
-] @operator
+  "["
+  "]"
+  "("
+  ")"
+] @punctuation.bracket
 
-[
-  (wildcard_node)
-  (anchor)
-] @constant.builtin
+"." @operator
 
-[
-  (anonymous_leaf)
-  (string)
-] @string
+(quantifier) @operator
 
 (comment) @comment
 
-(field_name) @variable.other.member
+(negated_field
+  "!" @operator
+  (identifier) @variable.other.member)
+
+(field_definition
+  name: (identifier) @variable.other.member)
+
+(named_node
+  name: (identifier) @tag)
+
+(predicate name: (identifier) @error)
+((predicate
+   "#" @function.builtin
+   name: (identifier) @function.builtin @_name
+   type: (predicate_type) @function.builtin)
+ (#any-of? @_name "eq" "not-eq" "match" "not-match" "any-of" "not-any-of" "is" "is-not" "not-same-line" "not-kind-eq" "set" "select-adjacent" "strip"))
 
 (capture) @label
 
-(predicate_name) @function
-
 (escape_sequence) @constant.character.escape
 
-(node_name) @variable
+(string) @string

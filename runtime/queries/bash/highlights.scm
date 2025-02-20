@@ -1,33 +1,55 @@
 [
   (string)
   (raw_string)
+  (ansi_c_string)
   (heredoc_body)
-  (heredoc_start)
 ] @string
+
+[
+  (heredoc_start)
+  (heredoc_end)
+] @label
 
 (command_name) @function
 
 (variable_name) @variable.other.member
 
 [
+  "if"
+  "then"
+  "else"
+  "elif"
+  "fi"
   "case"
+  "in"
+  "esac"
+] @keyword.control.conditional
+
+[
+  "for"
   "do"
   "done"
-  "elif"
-  "else"
-  "esac"
-  "export"
-  "fi"
-  "for"
-  "function"
-  "if"
-  "in"
-  "unset"
+  "select"
+  "until"
   "while"
-  "then"
+] @keyword.control.repeat
+
+[
+  "declare"
+  "typeset"
+  "export"
+  "readonly"
+  "local"
+  "unset"
+  "unsetenv"
 ] @keyword
 
+"function" @keyword.function
+
 (comment) @comment
+
+((word) @constant.builtin.boolean
+  (#any-of? @constant.builtin.boolean "true" "false"))
 
 (function_definition name: (word) @function)
 
@@ -37,7 +59,7 @@
   (command_substitution)
   (process_substitution)
   (expansion)
-]@embedded
+] @embedded
 
 [
   "$"

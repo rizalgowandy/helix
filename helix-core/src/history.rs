@@ -1,8 +1,14 @@
-use crate::{Assoc, ChangeSet, Range, Rope, State, Transaction};
+use crate::{Assoc, ChangeSet, Range, Rope, Selection, Transaction};
 use once_cell::sync::Lazy;
 use regex::Regex;
 use std::num::NonZeroUsize;
 use std::time::{Duration, Instant};
+
+#[derive(Debug, Clone)]
+pub struct State {
+    pub doc: Rope,
+    pub selection: Selection,
+}
 
 /// Stores the history of changes to a buffer.
 ///
@@ -22,10 +28,10 @@ use std::time::{Duration, Instant};
 ///
 /// The current revision is the one currently displayed in the buffer.
 ///
-/// Commiting a new revision to the history will update the last child of the
+/// Committing a new revision to the history will update the last child of the
 /// current revision, and push a new revision to the end of the vector.
 ///
-/// Revisions are commited with a timestamp. :earlier and :later can be used
+/// Revisions are committed with a timestamp. :earlier and :later can be used
 /// to jump to the closest revision to a moment in time relative to the timestamp
 /// of the current revision plus (:later) or minus (:earlier) the duration
 /// given to the command. If a single integer is given, the editor will instead
@@ -33,7 +39,7 @@ use std::time::{Duration, Instant};
 ///
 /// Limitations:
 ///  * Changes in selections currently don't commit history changes. The selection
-///    will only be updated to the state after a commited buffer change.
+///    will only be updated to the state after a committed buffer change.
 ///  * The vector of history revisions is currently unbounded. This might
 ///    cause the memory consumption to grow significantly large during long
 ///    editing sessions.
@@ -48,7 +54,7 @@ pub struct History {
 }
 
 /// A single point in history. See [History] for more information.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct Revision {
     parent: usize,
     last_child: Option<NonZeroUsize>,
@@ -66,8 +72,8 @@ impl Default for History {
             revisions: vec![Revision {
                 parent: 0,
                 last_child: None,
-                transaction: Transaction::from(ChangeSet::new(&Rope::new())),
-                inversion: Transaction::from(ChangeSet::new(&Rope::new())),
+                transaction: Transaction::from(ChangeSet::new("".into())),
+                inversion: Transaction::from(ChangeSet::new("".into())),
                 timestamp: Instant::now(),
             }],
             current: 0,
@@ -111,6 +117,21 @@ impl History {
     #[inline]
     pub const fn at_root(&self) -> bool {
         self.current == 0
+    }
+
+    /// Returns the changes since the given revision composed into a transaction.
+    /// Returns None if there are no changes between the current and given revisions.
+    pub fn changes_since(&self, revision: usize) -> Option<Transaction> {
+        let lca = self.lowest_common_ancestor(revision, self.current);
+        let up = self.path_up(revision, lca);
+        let down = self.path_up(self.current, lca);
+        let up_txns = up
+            .iter()
+            .rev()
+            .map(|&n| self.revisions[n].inversion.clone());
+        let down_txns = down.iter().map(|&n| self.revisions[n].transaction.clone());
+
+        down_txns.chain(up_txns).reduce(|acc, tx| tx.compose(acc))
     }
 
     /// Undo the last edit.
@@ -177,7 +198,7 @@ impl History {
         }
     }
 
-    /// List of nodes on the way from `n` to 'a`. Doesn`t include `a`.
+    /// List of nodes on the way from `n` to 'a`. Doesn't include `a`.
     /// Includes `n` unless `a == n`. `a` must be an ancestor of `n`.
     fn path_up(&self, mut n: usize, a: usize) -> Vec<usize> {
         let mut path = Vec::new();
@@ -282,13 +303,13 @@ impl History {
 }
 
 /// Whether to undo by a number of edits or a duration of time.
-#[derive(Debug, PartialEq, Clone, Copy)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum UndoKind {
     Steps(usize),
     TimePeriod(std::time::Duration),
 }
 
-/// A subset of sytemd.time time span syntax units.
+/// A subset of systemd.time time span syntax units.
 const TIME_UNITS: &[(&[&str], &str, u64)] = &[
     (&["seconds", "second", "sec", "s"], "seconds", 1),
     (&["minutes", "minute", "min", "m"], "minutes", 60),
@@ -366,12 +387,16 @@ impl std::str::FromStr for UndoKind {
 #[cfg(test)]
 mod test {
     use super::*;
+    use crate::Selection;
 
     #[test]
     fn test_undo_redo() {
         let mut history = History::default();
         let doc = Rope::from("hello");
-        let mut state = State::new(doc);
+        let mut state = State {
+            doc,
+            selection: Selection::point(0),
+        };
 
         let transaction1 =
             Transaction::change(&state.doc, vec![(5, 5, Some(" world!".into()))].into_iter());
@@ -420,7 +445,10 @@ mod test {
     fn test_earlier_later() {
         let mut history = History::default();
         let doc = Rope::from("a\n");
-        let mut state = State::new(doc);
+        let mut state = State {
+            doc,
+            selection: Selection::point(0),
+        };
 
         fn undo(history: &mut History, state: &mut State) {
             if let Some(transaction) = history.undo() {
@@ -448,8 +476,8 @@ mod test {
             change: crate::transaction::Change,
             instant: Instant,
         ) {
-            let txn = Transaction::change(&state.doc, vec![change.clone()].into_iter());
-            history.commit_revision_at_timestamp(&txn, &state, instant);
+            let txn = Transaction::change(&state.doc, vec![change].into_iter());
+            history.commit_revision_at_timestamp(&txn, state, instant);
             txn.apply(&mut state.doc);
         }
 
@@ -546,8 +574,8 @@ mod test {
 
         // Units are validated.
         assert_eq!(
-            "1 millenium".parse::<UndoKind>(),
-            Err("incorrect time unit: millenium".to_string())
+            "1 millennium".parse::<UndoKind>(),
+            Err("incorrect time unit: millennium".to_string())
         );
 
         // Units can't be specified twice.
