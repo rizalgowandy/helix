@@ -1,42 +1,23 @@
-# Installation
+# Installing Helix
 
-We provide pre-built binaries on the [GitHub Releases page](https://github.com/helix-editor/helix/releases).
+To install Helix, follow the instructions specific to your operating system.
+Note that:
 
-[![Packaging status](https://repology.org/badge/vertical-allrepos/helix.svg)](https://repology.org/project/helix/versions)
+- To get the latest nightly version of Helix, you need to
+  [build from source](./building-from-source.md).
 
-## OSX
+- To take full advantage of Helix, install the language servers for your
+  preferred programming languages. See the
+  [wiki](https://github.com/helix-editor/helix/wiki/Language-Server-Configurations)
+  for instructions.
 
-A Homebrew tap is available:
+## Pre-built binaries
 
-```
-brew tap helix-editor/helix
-brew install helix
-```
+Download pre-built binaries from the [GitHub Releases page](https://github.com/helix-editor/helix/releases).
+The tarball contents include an `hx` binary and a `runtime` directory.
+To set up Helix:
 
-## Linux
+1. Add the `hx` binary to your system's `$PATH` to allow it to be used from the command line.
+2. Copy the `runtime` directory to a location that `hx` searches for runtime files. A typical location on Linux/macOS is `~/.config/helix/runtime`.
 
-### NixOS
-
-A [flake](https://nixos.wiki/wiki/Flakes) containing the package is available in
-the project root. The flake can also be used to spin up a reproducible development
-shell for working on Helix.
-
-### Arch Linux
-
-Releases are available in the `community` repository.
-
-A [helix-git](https://aur.archlinux.org/packages/helix-git/) package is also available on the AUR, which builds the master branch.
-
-## Build from source
-
-```
-git clone --recurse-submodules --shallow-submodules -j8 https://github.com/helix-editor/helix
-cd helix
-cargo install --path helix-term
-```
-
-This will install the `hx` binary to `$HOME/.cargo/bin`.
-
-Helix also needs it's runtime files so make sure to copy/symlink the `runtime/` directory into the
-config directory (for example `~/.config/helix/runtime` on Linux/macOS). This location can be overriden
-via the `HELIX_RUNTIME` environment variable.
+To see the runtime directories that `hx` searches, run `hx --health`. If necessary, you can override the default runtime location by setting the `HELIX_RUNTIME` environment variable.

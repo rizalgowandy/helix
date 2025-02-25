@@ -1,10 +1,12 @@
 use bitflags::bitflags;
+use serde::{Deserialize, Serialize};
 use std::{
     cmp::{max, min},
     str::FromStr,
 };
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
 /// UNSTABLE
 pub enum CursorKind {
     /// █
@@ -17,15 +19,64 @@ pub enum CursorKind {
     Hidden,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+impl Default for CursorKind {
+    fn default() -> Self {
+        Self::Block
+    }
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
 pub struct Margin {
-    pub vertical: u16,
     pub horizontal: u16,
+    pub vertical: u16,
+}
+
+impl Margin {
+    pub fn none() -> Self {
+        Self {
+            horizontal: 0,
+            vertical: 0,
+        }
+    }
+
+    /// Set uniform margin for all sides.
+    pub const fn all(value: u16) -> Self {
+        Self {
+            horizontal: value,
+            vertical: value,
+        }
+    }
+
+    /// Set the margin of left and right sides to specified value.
+    pub const fn horizontal(value: u16) -> Self {
+        Self {
+            horizontal: value,
+            vertical: 0,
+        }
+    }
+
+    /// Set the margin of top and bottom sides to specified value.
+    pub const fn vertical(value: u16) -> Self {
+        Self {
+            horizontal: 0,
+            vertical: value,
+        }
+    }
+
+    /// Get the total width of the margin (left + right)
+    pub const fn width(&self) -> u16 {
+        self.horizontal * 2
+    }
+
+    /// Get the total height of the margin (top + bottom)
+    pub const fn height(&self) -> u16 {
+        self.vertical * 2
+    }
 }
 
 /// A simple rectangle used in the computation of the layout and to give widgets an hint about the
 /// area they are supposed to render to. (x, y) = (0, 0) is at the top left corner of the screen.
-#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, Copy, Hash, PartialEq, Eq)]
 pub struct Rect {
     pub x: u16,
     pub y: u16,
@@ -33,43 +84,20 @@ pub struct Rect {
     pub height: u16,
 }
 
-impl Default for Rect {
-    fn default() -> Rect {
-        Rect {
-            x: 0,
-            y: 0,
-            width: 0,
-            height: 0,
-        }
-    }
-}
-
 impl Rect {
-    /// Creates a new rect, with width and height limited to keep the area under max u16.
-    /// If clipped, aspect ratio will be preserved.
+    /// Creates a new rect, with width and height
     pub fn new(x: u16, y: u16, width: u16, height: u16) -> Rect {
-        let max_area = u16::max_value();
-        let (clipped_width, clipped_height) =
-            if u32::from(width) * u32::from(height) > u32::from(max_area) {
-                let aspect_ratio = f64::from(width) / f64::from(height);
-                let max_area_f = f64::from(max_area);
-                let height_f = (max_area_f / aspect_ratio).sqrt();
-                let width_f = height_f * aspect_ratio;
-                (width_f as u16, height_f as u16)
-            } else {
-                (width, height)
-            };
         Rect {
             x,
             y,
-            width: clipped_width,
-            height: clipped_height,
+            width,
+            height,
         }
     }
 
     #[inline]
-    pub fn area(self) -> u16 {
-        self.width * self.height
+    pub fn area(self) -> usize {
+        (self.width as usize) * (self.height as usize)
     }
 
     #[inline]
@@ -143,15 +171,15 @@ impl Rect {
         Self::new(self.x, self.y, width, self.height)
     }
 
-    pub fn inner(self, margin: &Margin) -> Rect {
-        if self.width < 2 * margin.horizontal || self.height < 2 * margin.vertical {
+    pub fn inner(self, margin: Margin) -> Rect {
+        if self.width < margin.width() || self.height < margin.height() {
             Rect::default()
         } else {
             Rect {
                 x: self.x + margin.horizontal,
                 y: self.y + margin.vertical,
-                width: self.width - 2 * margin.horizontal,
-                height: self.height - 2 * margin.vertical,
+                width: self.width - margin.width(),
+                height: self.height - margin.height(),
             }
         }
     }
@@ -199,8 +227,8 @@ impl Rect {
         Rect {
             x: x1,
             y: y1,
-            width: x2 - x1,
-            height: y2 - y1,
+            width: x2.saturating_sub(x1),
+            height: y2.saturating_sub(y1),
         }
     }
 
@@ -212,8 +240,7 @@ impl Rect {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Color {
     Reset,
     Black,
@@ -234,6 +261,31 @@ pub enum Color {
     White,
     Rgb(u8, u8, u8),
     Indexed(u8),
+}
+
+impl Color {
+    /// Creates a `Color` from a hex string
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use helix_view::theme::Color;
+    ///
+    /// let color1 = Color::from_hex("#c0ffee").unwrap();
+    /// let color2 = Color::Rgb(192, 255, 238);
+    ///
+    /// assert_eq!(color1, color2);
+    /// ```
+    pub fn from_hex(hex: &str) -> Option<Self> {
+        if !(hex.starts_with('#') && hex.len() == 7) {
+            return None;
+        }
+        match [1..=2, 3..=4, 5..=6].map(|i| hex.get(i).and_then(|c| u8::from_str_radix(c, 16).ok()))
+        {
+            [Some(r), Some(g), Some(b)] => Some(Self::Rgb(r, g, b)),
+            _ => None,
+        }
+    }
 }
 
 #[cfg(feature = "term")]
@@ -265,6 +317,45 @@ impl From<Color> for crossterm::style::Color {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnderlineStyle {
+    Reset,
+    Line,
+    Curl,
+    Dotted,
+    Dashed,
+    DoubleLine,
+}
+
+impl FromStr for UnderlineStyle {
+    type Err = &'static str;
+
+    fn from_str(modifier: &str) -> Result<Self, Self::Err> {
+        match modifier {
+            "line" => Ok(Self::Line),
+            "curl" => Ok(Self::Curl),
+            "dotted" => Ok(Self::Dotted),
+            "dashed" => Ok(Self::Dashed),
+            "double_line" => Ok(Self::DoubleLine),
+            _ => Err("Invalid underline style"),
+        }
+    }
+}
+
+#[cfg(feature = "term")]
+impl From<UnderlineStyle> for crossterm::style::Attribute {
+    fn from(style: UnderlineStyle) -> Self {
+        match style {
+            UnderlineStyle::Line => crossterm::style::Attribute::Underlined,
+            UnderlineStyle::Curl => crossterm::style::Attribute::Undercurled,
+            UnderlineStyle::Dotted => crossterm::style::Attribute::Underdotted,
+            UnderlineStyle::Dashed => crossterm::style::Attribute::Underdashed,
+            UnderlineStyle::DoubleLine => crossterm::style::Attribute::DoubleUnderlined,
+            UnderlineStyle::Reset => crossterm::style::Attribute::NoUnderline,
+        }
+    }
+}
+
 bitflags! {
     /// Modifier changes the way a piece of text is displayed.
     ///
@@ -277,12 +368,11 @@ bitflags! {
     ///
     /// let m = Modifier::BOLD | Modifier::ITALIC;
     /// ```
-    #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+    #[derive(PartialEq, Eq, Debug, Clone, Copy)]
     pub struct Modifier: u16 {
         const BOLD              = 0b0000_0000_0001;
         const DIM               = 0b0000_0000_0010;
         const ITALIC            = 0b0000_0000_0100;
-        const UNDERLINED        = 0b0000_0000_1000;
         const SLOW_BLINK        = 0b0000_0001_0000;
         const RAPID_BLINK       = 0b0000_0010_0000;
         const REVERSED          = 0b0000_0100_0000;
@@ -299,7 +389,6 @@ impl FromStr for Modifier {
             "bold" => Ok(Self::BOLD),
             "dim" => Ok(Self::DIM),
             "italic" => Ok(Self::ITALIC),
-            "underlined" => Ok(Self::UNDERLINED),
             "slow_blink" => Ok(Self::SLOW_BLINK),
             "rapid_blink" => Ok(Self::RAPID_BLINK),
             "reversed" => Ok(Self::REVERSED),
@@ -325,7 +414,7 @@ impl FromStr for Modifier {
 /// just S3.
 ///
 /// ```rust
-/// # use helix_view::graphics::{Rect, Color, Modifier, Style};
+/// # use helix_view::graphics::{Rect, Color, UnderlineStyle, Modifier, Style};
 /// # use helix_tui::buffer::Buffer;
 /// let styles = [
 ///     Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD | Modifier::ITALIC),
@@ -334,16 +423,18 @@ impl FromStr for Modifier {
 /// ];
 /// let mut buffer = Buffer::empty(Rect::new(0, 0, 1, 1));
 /// for style in &styles {
-///   buffer.get_mut(0, 0).set_style(*style);
+///   buffer[(0, 0)].set_style(*style);
 /// }
 /// assert_eq!(
 ///     Style {
 ///         fg: Some(Color::Yellow),
 ///         bg: Some(Color::Red),
 ///         add_modifier: Modifier::BOLD,
+///         underline_color: Some(Color::Reset),
+///         underline_style: Some(UnderlineStyle::Reset),
 ///         sub_modifier: Modifier::empty(),
 ///     },
-///     buffer.get(0, 0).style(),
+///     buffer[(0, 0)].style(),
 /// );
 /// ```
 ///
@@ -351,7 +442,7 @@ impl FromStr for Modifier {
 /// reset all properties until that point use [`Style::reset`].
 ///
 /// ```
-/// # use helix_view::graphics::{Rect, Color, Modifier, Style};
+/// # use helix_view::graphics::{Rect, Color, UnderlineStyle, Modifier, Style};
 /// # use helix_tui::buffer::Buffer;
 /// let styles = [
 ///     Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD | Modifier::ITALIC),
@@ -359,44 +450,55 @@ impl FromStr for Modifier {
 /// ];
 /// let mut buffer = Buffer::empty(Rect::new(0, 0, 1, 1));
 /// for style in &styles {
-///   buffer.get_mut(0, 0).set_style(*style);
+///   buffer[(0, 0)].set_style(*style);
 /// }
 /// assert_eq!(
 ///     Style {
 ///         fg: Some(Color::Yellow),
 ///         bg: Some(Color::Reset),
+///         underline_color: Some(Color::Reset),
+///         underline_style: Some(UnderlineStyle::Reset),
 ///         add_modifier: Modifier::empty(),
 ///         sub_modifier: Modifier::empty(),
 ///     },
-///     buffer.get(0, 0).style(),
+///     buffer[(0, 0)].style(),
 /// );
 /// ```
-#[derive(Debug, Clone, Copy, PartialEq)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Style {
     pub fg: Option<Color>,
     pub bg: Option<Color>,
+    pub underline_color: Option<Color>,
+    pub underline_style: Option<UnderlineStyle>,
     pub add_modifier: Modifier,
     pub sub_modifier: Modifier,
 }
 
 impl Default for Style {
-    fn default() -> Style {
-        Style {
-            fg: None,
-            bg: None,
-            add_modifier: Modifier::empty(),
-            sub_modifier: Modifier::empty(),
-        }
+    fn default() -> Self {
+        Self::new()
     }
 }
 
 impl Style {
-    /// Returns a `Style` resetting all properties.
-    pub fn reset() -> Style {
+    pub const fn new() -> Self {
         Style {
+            fg: None,
+            bg: None,
+            underline_color: None,
+            underline_style: None,
+            add_modifier: Modifier::empty(),
+            sub_modifier: Modifier::empty(),
+        }
+    }
+
+    /// Returns a `Style` resetting all properties.
+    pub const fn reset() -> Self {
+        Self {
             fg: Some(Color::Reset),
             bg: Some(Color::Reset),
+            underline_color: None,
+            underline_style: None,
             add_modifier: Modifier::empty(),
             sub_modifier: Modifier::all(),
         }
@@ -412,7 +514,7 @@ impl Style {
     /// let diff = Style::default().fg(Color::Red);
     /// assert_eq!(style.patch(diff), Style::default().fg(Color::Red));
     /// ```
-    pub fn fg(mut self, color: Color) -> Style {
+    pub const fn fg(mut self, color: Color) -> Style {
         self.fg = Some(color);
         self
     }
@@ -427,8 +529,38 @@ impl Style {
     /// let diff = Style::default().bg(Color::Red);
     /// assert_eq!(style.patch(diff), Style::default().bg(Color::Red));
     /// ```
-    pub fn bg(mut self, color: Color) -> Style {
+    pub const fn bg(mut self, color: Color) -> Style {
         self.bg = Some(color);
+        self
+    }
+
+    /// Changes the underline color.
+    ///
+    /// ## Examples
+    ///
+    /// ```rust
+    /// # use helix_view::graphics::{Color, Style};
+    /// let style = Style::default().underline_color(Color::Blue);
+    /// let diff = Style::default().underline_color(Color::Red);
+    /// assert_eq!(style.patch(diff), Style::default().underline_color(Color::Red));
+    /// ```
+    pub const fn underline_color(mut self, color: Color) -> Style {
+        self.underline_color = Some(color);
+        self
+    }
+
+    /// Changes the underline style.
+    ///
+    /// ## Examples
+    ///
+    /// ```rust
+    /// # use helix_view::graphics::{UnderlineStyle, Style};
+    /// let style = Style::default().underline_style(UnderlineStyle::Line);
+    /// let diff = Style::default().underline_style(UnderlineStyle::Curl);
+    /// assert_eq!(style.patch(diff), Style::default().underline_style(UnderlineStyle::Curl));
+    /// ```
+    pub const fn underline_style(mut self, style: UnderlineStyle) -> Style {
+        self.underline_style = Some(style);
         self
     }
 
@@ -488,6 +620,8 @@ impl Style {
     pub fn patch(mut self, other: Style) -> Style {
         self.fg = other.fg.or(self.fg);
         self.bg = other.bg.or(self.bg);
+        self.underline_color = other.underline_color.or(self.underline_color);
+        self.underline_style = other.underline_style.or(self.underline_style);
 
         self.add_modifier.remove(other.sub_modifier);
         self.add_modifier.insert(other.add_modifier);
@@ -501,33 +635,6 @@ impl Style {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_rect_size_truncation() {
-        for width in 256u16..300u16 {
-            for height in 256u16..300u16 {
-                let rect = Rect::new(0, 0, width, height);
-                rect.area(); // Should not panic.
-                assert!(rect.width < width || rect.height < height);
-                // The target dimensions are rounded down so the math will not be too precise
-                // but let's make sure the ratios don't diverge crazily.
-                assert!(
-                    (f64::from(rect.width) / f64::from(rect.height)
-                        - f64::from(width) / f64::from(height))
-                    .abs()
-                        < 1.0
-                )
-            }
-        }
-
-        // One dimension below 255, one above. Area above max u16.
-        let width = 900;
-        let height = 100;
-        let rect = Rect::new(0, 0, width, height);
-        assert_ne!(rect.width, 900);
-        assert_ne!(rect.height, 100);
-        assert!(rect.width < width || rect.height < height);
-    }
 
     #[test]
     fn test_rect_size_preservation() {

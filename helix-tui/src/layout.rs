@@ -46,7 +46,7 @@ impl Constraint {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Alignment {
     Left,
     Center,
@@ -68,10 +68,7 @@ impl Default for Layout {
     fn default() -> Layout {
         Layout {
             direction: Direction::Vertical,
-            margin: Margin {
-                horizontal: 0,
-                vertical: 0,
-            },
+            margin: Margin::none(),
             constraints: Vec::new(),
         }
     }
@@ -86,25 +83,22 @@ impl Layout {
         self
     }
 
-    pub fn margin(mut self, margin: u16) -> Layout {
-        self.margin = Margin {
-            horizontal: margin,
-            vertical: margin,
-        };
+    pub const fn margin(mut self, margin: u16) -> Layout {
+        self.margin = Margin::all(margin);
         self
     }
 
-    pub fn horizontal_margin(mut self, horizontal: u16) -> Layout {
+    pub const fn horizontal_margin(mut self, horizontal: u16) -> Layout {
         self.margin.horizontal = horizontal;
         self
     }
 
-    pub fn vertical_margin(mut self, vertical: u16) -> Layout {
+    pub const fn vertical_margin(mut self, vertical: u16) -> Layout {
         self.margin.vertical = vertical;
         self
     }
 
-    pub fn direction(mut self, direction: Direction) -> Layout {
+    pub const fn direction(mut self, direction: Direction) -> Layout {
         self.direction = direction;
         self
     }
@@ -195,7 +189,7 @@ fn split(area: Rect, layout: &Layout) -> Vec<Rect> {
         .map(|_| Rect::default())
         .collect::<Vec<Rect>>();
 
-    let dest_area = area.inner(&layout.margin);
+    let dest_area = area.inner(layout.margin);
     for (i, e) in elements.iter().enumerate() {
         vars.insert(e.x, (i, 0));
         vars.insert(e.y, (i, 1));

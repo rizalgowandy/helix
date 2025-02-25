@@ -1,12 +1,12 @@
-use crate::input::KeyEvent;
+use crate::register::Registers;
 use helix_core::unicode::width::UnicodeWidthStr;
-use std::{collections::BTreeSet, fmt::Write};
+use std::{borrow::Cow, fmt::Write};
 
 #[derive(Debug)]
 /// Info box used in editor. Rendering logic will be in other crate.
 pub struct Info {
     /// Title shown at top.
-    pub title: String,
+    pub title: Cow<'static, str>,
     /// Text body, should contain newlines.
     pub text: String,
     /// Body width.
@@ -16,33 +16,55 @@ pub struct Info {
 }
 
 impl Info {
-    pub fn new(title: &str, body: Vec<(&str, BTreeSet<KeyEvent>)>) -> Info {
-        let body = body
-            .into_iter()
-            .map(|(desc, events)| {
-                let events = events.iter().map(ToString::to_string).collect::<Vec<_>>();
-                (desc, events.join(", "))
-            })
-            .collect::<Vec<_>>();
+    pub fn new<T, K, V>(title: T, body: &[(K, V)]) -> Self
+    where
+        T: Into<Cow<'static, str>>,
+        K: AsRef<str>,
+        V: AsRef<str>,
+    {
+        let title = title.into();
+        if body.is_empty() {
+            return Self {
+                height: 1,
+                width: title.len() as u16,
+                text: "".to_string(),
+                title,
+            };
+        }
 
-        let keymaps_width = body.iter().map(|r| r.1.len()).max().unwrap();
+        let item_width = body
+            .iter()
+            .map(|(item, _)| item.as_ref().width())
+            .max()
+            .unwrap();
         let mut text = String::new();
 
-        for (desc, keyevents) in &body {
+        for (item, desc) in body {
             let _ = writeln!(
                 text,
                 "{:width$}  {}",
-                keyevents,
-                desc,
-                width = keymaps_width
+                item.as_ref(),
+                desc.as_ref(),
+                width = item_width
             );
         }
 
-        Info {
-            title: title.to_string(),
+        Self {
+            title,
             width: text.lines().map(|l| l.width()).max().unwrap() as u16,
             height: body.len() as u16,
             text,
         }
+    }
+
+    pub fn from_registers(title: impl Into<Cow<'static, str>>, registers: &Registers) -> Self {
+        let body: Vec<_> = registers
+            .iter_preview()
+            .map(|(ch, preview)| (ch.to_string(), preview))
+            .collect();
+
+        let mut infobox = Self::new(title, &body);
+        infobox.width = 30; // copied content could be very long
+        infobox
     }
 }
